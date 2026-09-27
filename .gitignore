@@ -219,3 +219,6 @@ gradio_outputs/
 gradio_outputs_voicedesign/
 outputs/
 data/
+
+# Local benchmark results (device names, absolute paths)
+artifacts/local/
