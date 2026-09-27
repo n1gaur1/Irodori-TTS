@@ -49,14 +49,31 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return x_.type_as(x)
 
 
+_TIMESTEP_FREQS_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _timestep_freqs(device: torch.device, half: int) -> torch.Tensor:
+    # Cached so the forward issues no host-to-device copy, which CUDA Graph
+    # capture forbids. The values come from the same ops as before.
+    key = (device, half)
+    freqs = _TIMESTEP_FREQS_CACHE.get(key)
+    if freqs is None:
+        # A tensor made under inference_mode could never be saved for
+        # backward, which would break later training use of the cache.
+        with torch.inference_mode(False), torch.no_grad():
+            freqs = 1000.0 * torch.exp(
+                -torch.log(torch.tensor(10000.0, device=device, dtype=torch.float32))
+                * torch.arange(half, device=device, dtype=torch.float32)
+                / half
+            )
+        _TIMESTEP_FREQS_CACHE[key] = freqs
+    return freqs
+
+
 def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
     assert dim % 2 == 0
     half = dim // 2
-    freqs = 1000.0 * torch.exp(
-        -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float32))
-        * torch.arange(half, device=timestep.device, dtype=torch.float32)
-        / half
-    )
+    freqs = _timestep_freqs(timestep.device, half)
     args = timestep[:, None].float() * freqs[None, :]
     return torch.cat([torch.cos(args), torch.sin(args)], dim=-1).to(timestep.dtype)
 

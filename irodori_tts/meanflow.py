@@ -503,8 +503,21 @@ def sample_euler_meanflow(
     speaker_uncond_mode: str = "mask",
     num_steps: int = 4,
     seed: int = 0,
+    encoded_conditions: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]
+    | None = None,
 ) -> torch.Tensor:
-    """Linear MeanFlow sampler from Irodori time 1 to 0 (default: 4 NFE)."""
+    """Linear MeanFlow sampler from Irodori time 1 to 0 (default: 4 NFE).
+
+    ``encoded_conditions`` is the output of ``model.encode_conditions`` for these
+    inputs (e.g. reused from duration prediction); it skips encoding them again.
+    """
     if str(model.cfg.flow_parameterization).strip().lower() != "meanflow":
         raise ValueError("sample_euler_meanflow requires a MeanFlow model.")
     if num_steps <= 0:
@@ -523,8 +536,8 @@ def sample_euler_meanflow(
     if rng_device != device:
         x_t = x_t.to(device=device)
 
-    encoded = EncodedConditions(
-        *model.encode_conditions(
+    if encoded_conditions is None:
+        encoded_conditions = model.encode_conditions(
             text_input_ids=text_input_ids,
             text_mask=text_mask,
             ref_latent=ref_latent,
@@ -535,7 +548,7 @@ def sample_euler_meanflow(
             speaker_mask_override=speaker_mask_override,
             speaker_uncond_mode=speaker_uncond_mode,
         )
-    )
+    encoded = EncodedConditions(*encoded_conditions)
     context_kv_cache = model.build_context_kv_cache(
         text_state=encoded.text_state,
         speaker_state=encoded.speaker_state,

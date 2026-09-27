@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 
@@ -143,13 +144,29 @@ def sample_euler_rf_cfg(
     speaker_kv_min_t: float | None = None,
     t_schedule_mode: str = "linear",
     sway_coeff: float = -1.0,
+    encoded_conditions: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]
+    | None = None,
+    forward_fn: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
 
+    encoded_conditions: output of ``model.encode_conditions`` for exactly these
+      inputs (e.g. reused from duration prediction); skips encoding them again.
+    forward_fn: drop-in replacement for ``model.forward_with_encoded_conditions``
+      such as a CUDA Graph runner.
+
     Returns:
       latent sequence in patched space, shape (B, sequence_length, patched_latent_dim)
     """
+    forward = model.forward_with_encoded_conditions if forward_fn is None else forward_fn
     device = model.device
     dtype = model.dtype
     batch_size = text_input_ids.shape[0]
@@ -204,12 +221,27 @@ def sample_euler_rf_cfg(
             f"Unsupported t_schedule_mode={t_schedule_mode!r}. Expected 'linear' or 'sway'."
         )
     t_schedule = (1.0 - u) * init_scale
-    if not bool(torch.all(t_schedule[:-1] > t_schedule[1:]).item()):
+    # Read the schedule back once so per-step branching needs no device sync.
+    # The Euler update keeps using the device tensor.
+    t_values = t_schedule.tolist()
+    if not all(t > t_next for t, t_next in zip(t_values[:-1], t_values[1:], strict=True)):
         raise ValueError("t_schedule must be strictly decreasing; adjust num_steps or sway_coeff.")
     use_independent_cfg = cfg_guidance_mode == "independent"
     use_joint_cfg = cfg_guidance_mode == "joint"
     use_alternating_cfg = cfg_guidance_mode == "alternating"
 
+    if encoded_conditions is None:
+        encoded_conditions = model.encode_conditions(
+            text_input_ids=text_input_ids,
+            text_mask=text_mask,
+            ref_latent=ref_latent,
+            ref_mask=ref_mask,
+            caption_input_ids=caption_input_ids,
+            caption_mask=caption_mask,
+            speaker_state_override=speaker_state_override,
+            speaker_mask_override=speaker_mask_override,
+            speaker_uncond_mode=speaker_uncond_mode,
+        )
     (
         text_state_cond,
         text_mask_cond,
@@ -217,17 +249,7 @@ def sample_euler_rf_cfg(
         speaker_mask_cond,
         caption_state_cond,
         caption_mask_cond,
-    ) = model.encode_conditions(
-        text_input_ids=text_input_ids,
-        text_mask=text_mask,
-        ref_latent=ref_latent,
-        ref_mask=ref_mask,
-        caption_input_ids=caption_input_ids,
-        caption_mask=caption_mask,
-        speaker_state_override=speaker_state_override,
-        speaker_mask_override=speaker_mask_override,
-        speaker_uncond_mode=speaker_uncond_mode,
-    )
+    ) = encoded_conditions
     text_state_uncond = torch.zeros_like(text_state_cond)
     text_mask_uncond = torch.zeros_like(text_mask_cond)
     speaker_state_uncond = None
@@ -455,18 +477,27 @@ def sample_euler_rf_cfg(
                 max_layers=speaker_kv_max_layers,
             )
     speaker_kv_active = speaker_kv_scale is not None
+    # The restore check compared float32 schedule values against the threshold,
+    # which rounds the threshold to float32 as well.
+    speaker_kv_min_t_f32 = (
+        None
+        if speaker_kv_min_t is None
+        else torch.tensor(float(speaker_kv_min_t), dtype=t_schedule.dtype).item()
+    )
 
     for i in range(num_steps):
         t = t_schedule[i]
         t_next = t_schedule[i + 1]
-        tt = torch.full((batch_size,), t, device=device, dtype=dtype)
+        t_value = t_values[i]
+        t_next_value = t_values[i + 1]
+        tt = torch.full((batch_size,), t_value, device=device, dtype=dtype)
 
-        use_cfg = bool(enabled_cfg_names) and (cfg_min_t <= t.item() <= cfg_max_t)
+        use_cfg = bool(enabled_cfg_names) and (cfg_min_t <= t_value <= cfg_max_t)
         if use_cfg:
             if use_independent_cfg:
                 x_t_cfg = torch.cat([x_t] * cfg_batch_mult, dim=0).to(dtype)
                 tt_cfg = tt.repeat(cfg_batch_mult)
-                v_out = model.forward_with_encoded_conditions(
+                v_out = forward(
                     x_t=x_t_cfg,
                     t=tt_cfg,
                     text_state=independent_text_state,
@@ -482,7 +513,7 @@ def sample_euler_rf_cfg(
                 for name, chunk in zip(independent_names[1:], chunks[1:], strict=True):
                     v = v + cfg_scales[name] * (chunks[0] - chunk)
             else:
-                v_cond = model.forward_with_encoded_conditions(
+                v_cond = forward(
                     x_t=x_t.to(dtype),
                     t=tt,
                     text_state=text_state_cond,
@@ -502,7 +533,7 @@ def sample_euler_rf_cfg(
                                 "set matching text/speaker/caption scales or use --cfg-scale."
                             )
                     joint_scale = cfg_scales[enabled_cfg_names[0]]
-                    v_uncond_joint = model.forward_with_encoded_conditions(
+                    v_uncond_joint = forward(
                         x_t=x_t.to(dtype),
                         t=tt,
                         text_state=joint_uncond_bundle[0],
@@ -517,7 +548,7 @@ def sample_euler_rf_cfg(
                 elif use_alternating_cfg:
                     alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
                     alt_bundle = alternating_bundles[alt_name]
-                    v_uncond_alt = model.forward_with_encoded_conditions(
+                    v_uncond_alt = forward(
                         x_t=x_t.to(dtype),
                         t=tt,
                         text_state=alt_bundle[0],
@@ -532,7 +563,7 @@ def sample_euler_rf_cfg(
                 else:
                     raise RuntimeError(f"Unexpected cfg_guidance_mode: {cfg_guidance_mode}")
         else:
-            v = model.forward_with_encoded_conditions(
+            v = forward(
                 x_t=x_t.to(dtype),
                 t=tt,
                 text_state=text_state_cond,
@@ -548,16 +579,16 @@ def sample_euler_rf_cfg(
             v = temporal_score_rescale(
                 v_pred=v,
                 x_t=x_t,
-                t=t,
+                t=t_value,
                 rescale_k=float(rescale_k),
                 rescale_sigma=float(rescale_sigma),
             )
 
         if (
             speaker_kv_active
-            and speaker_kv_min_t is not None
-            and (t_next < speaker_kv_min_t)
-            and (t >= speaker_kv_min_t)
+            and speaker_kv_min_t_f32 is not None
+            and (t_next_value < speaker_kv_min_t_f32)
+            and (t_value >= speaker_kv_min_t_f32)
         ):
             inv_scale = 1.0 / float(speaker_kv_scale)
             scale_speaker_kv_cache(

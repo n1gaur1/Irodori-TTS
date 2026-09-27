@@ -4,12 +4,14 @@ import gc
 import hashlib
 import json
 import math
+import os
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from safetensors.torch import load_file as load_safetensors_file
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig, merge_dataclass_overrides
+from .cuda_graph import CUDAGraphForward, resolve_cuda_graph_mode
 from .duration import build_duration_features
 from .lora import checkpoint_state_uses_lora, is_lora_adapter_dir, load_lora_adapter
 from .meanflow import sample_euler_meanflow
@@ -175,11 +178,32 @@ def find_flattening_point(
         dtype=latent.dtype,
     )
     padded = torch.cat([latent, pad], dim=0)
-    for i in range(padded.shape[0] - window_size):
+
+    def _is_flat(i: int) -> bool:
         window = padded[i : i + window_size]
         window_std = window.std(unbiased=False)
         window_mean = window.mean()
-        if window_std < std_threshold and torch.abs(window_mean - target_value) < mean_threshold:
+        return bool(
+            window_std < std_threshold and torch.abs(window_mean - target_value) < mean_threshold
+        )
+
+    # Scanning window by window costs two device syncs per frame. Screen every
+    # window at once with loosened thresholds instead, then confirm candidates
+    # in order with the exact per-window check above. The margins exceed the
+    # float32/bfloat16 rounding differences between the two computations, so a
+    # window the exact check accepts is never screened out and the result
+    # matches the sequential scan.
+    windows = padded.float().unfold(0, window_size, 1)[:total_steps]
+    screen_std = windows.std(dim=(1, 2), unbiased=False)
+    screen_mean_dev = torch.abs(windows.mean(dim=(1, 2)) - float(target_value))
+    std_margin = abs(float(std_threshold)) * 0.05 + 1e-4
+    mean_margin = abs(float(mean_threshold)) * 0.05 + abs(float(target_value)) * 0.01 + 1e-4
+    candidates = torch.nonzero(
+        (screen_std < float(std_threshold) + std_margin)
+        & (screen_mean_dev < float(mean_threshold) + mean_margin)
+    ).flatten()
+    for i in candidates.tolist():
+        if _is_flat(int(i)):
             return int(i)
     return total_steps
 
@@ -196,6 +220,14 @@ class RuntimeKey:
     codec_deterministic_decode: bool = True
     compile_model: bool = False
     compile_dynamic: bool = False
+    # auto | on | off. auto uses CUDA Graphs on CUDA without compile_model and
+    # honors IRODORI_CUDA_GRAPH. Replayed forwards match eager output exactly.
+    cuda_graph: str = "auto"
+    # Encoded reference-audio latents kept on the CPU, keyed by file content
+    # and encode settings. Used only with codec_deterministic_encode=True.
+    # 0 entries disables the cache.
+    reference_cache_max_entries: int = 16
+    reference_cache_max_bytes: int = 64 * 1024 * 1024
 
 
 @dataclass
@@ -256,6 +288,92 @@ class SamplingResult:
     total_to_decode: float
     used_seed: int
     messages: list[str]
+
+
+@dataclass(frozen=True)
+class _ReferenceCacheEntry:
+    latent: torch.Tensor
+    trim_message: str | None
+
+
+class ReferenceLatentCache:
+    """LRU cache of encoded reference waveforms, bounded by entry count and bytes.
+
+    Keys hold the file's resolved path, size, mtime and SHA-256 plus the
+    request's encode settings; the owning runtime fixes the codec. Values are
+    CPU latents exactly as ``DACVAECodec.encode_waveform`` returned them, so a
+    hit feeds the model the same tensor a fresh encode would.
+    """
+
+    def __init__(self, *, max_entries: int, max_bytes: int) -> None:
+        if max_entries < 0:
+            raise ValueError(f"reference_cache_max_entries must be >= 0, got {max_entries}")
+        if max_bytes < 0:
+            raise ValueError(f"reference_cache_max_bytes must be >= 0, got {max_bytes}")
+        self.max_entries = int(max_entries)
+        self.max_bytes = int(max_bytes)
+        self._entries: OrderedDict[tuple, _ReferenceCacheEntry] = OrderedDict()
+        self._bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_entries > 0 and self.max_bytes > 0
+
+    @property
+    def num_bytes(self) -> int:
+        return self._bytes
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    @staticmethod
+    def file_fingerprint(path: str | Path) -> tuple[str, int, int, str]:
+        resolved = Path(path).expanduser().resolve()
+        stat = resolved.stat()
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        return (str(resolved), int(stat.st_size), int(stat.st_mtime_ns), digest)
+
+    @staticmethod
+    def file_unchanged(fingerprint: tuple[str, int, int, str]) -> bool:
+        """True when the file still has the size and mtime seen by the fingerprint."""
+        try:
+            stat = os.stat(fingerprint[0])
+        except OSError:
+            return False
+        return (int(stat.st_size), int(stat.st_mtime_ns)) == fingerprint[1:3]
+
+    def get(self, key: tuple) -> _ReferenceCacheEntry | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            self.misses += 1
+            return None
+        self._entries.move_to_end(key)
+        self.hits += 1
+        return entry
+
+    def put(self, key: tuple, latent: torch.Tensor, trim_message: str | None) -> None:
+        latent = latent.detach()
+        size = latent.numel() * latent.element_size()
+        if not self.enabled or size > self.max_bytes:
+            return
+        old = self._entries.pop(key, None)
+        if old is not None:
+            self._bytes -= old.latent.numel() * old.latent.element_size()
+        while self._entries and (
+            len(self._entries) >= self.max_entries or self._bytes + size > self.max_bytes
+        ):
+            _, evicted = self._entries.popitem(last=False)
+            self._bytes -= evicted.latent.numel() * evicted.latent.element_size()
+            self.evictions += 1
+        self._entries[key] = _ReferenceCacheEntry(latent=latent, trim_message=trim_message)
+        self._bytes += size
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
 
 
 def _maybe_compile_inference_model(
@@ -620,11 +738,34 @@ class InferenceRuntime:
         self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
+        self._graph_forward: CUDAGraphForward | None = None
+        if resolve_cuda_graph_mode(
+            key.cuda_graph,
+            device=self.model_device,
+            compile_model=bool(key.compile_model),
+        ):
+            self._graph_forward = CUDAGraphForward(
+                # Look the model up per call: LoRA loading replaces self.model.
+                lambda **kwargs: self.model.forward_with_encoded_conditions(**kwargs),
+                # Graphs read module buffers such as the RoPE cache directly;
+                # keep their storage alive even if the attribute is replaced.
+                keepalive=lambda: tuple(self.model.buffers()),
+            )
+        self.reference_cache = ReferenceLatentCache(
+            max_entries=int(key.reference_cache_max_entries),
+            max_bytes=int(key.reference_cache_max_bytes),
+        )
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
         model_device = resolve_runtime_device(key.model_device)
         codec_device = resolve_runtime_device(key.codec_device)
+        # Reject an invalid cuda_graph setting before spending time on loading.
+        resolve_cuda_graph_mode(
+            key.cuda_graph,
+            device=model_device,
+            compile_model=bool(key.compile_model),
+        )
         model_dtype = resolve_runtime_dtype(
             precision=key.model_precision,
             device=model_device,
@@ -803,6 +944,10 @@ class InferenceRuntime:
 
         if self.key.compile_model:
             raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
+        if self._graph_forward is not None:
+            # Captured graphs belong to the unadapted module; adapters stay
+            # eager for the rest of this runtime's life.
+            self._graph_forward.clear()
 
         adapter_name = self._lora_adapter_names.get(resolved_path)
         if adapter_name is None:
@@ -925,25 +1070,63 @@ class InferenceRuntime:
                     "info: reference peak safety scaling enabled per clip (ensure_max=True)."
                 )
             latent_pieces = []
+            # A stochastic encode must run every time; caching would freeze one sample.
+            cache = (
+                self.reference_cache
+                if self.reference_cache.enabled and self.codec.deterministic_encode
+                else None
+            )
+            cache_hits = 0
             for path in wav_paths:
-                wav, sr = _load_audio(path)
-                if len(wav_paths) == 1 and max_ref_seconds > 0:
-                    max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
-                    if wav.shape[1] > max_ref_samples:
-                        messages.append(
-                            f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
-                            f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
-                        )
-                        wav = wav[:, :max_ref_samples]
-                piece = self.codec.encode_waveform(
-                    wav.unsqueeze(0),
-                    sample_rate=int(sr),
-                    normalize_db=req.ref_normalize_db,
-                    ensure_max=bool(req.ref_ensure_max),
-                ).cpu()
-                if piece.shape[1] == 0:
-                    raise ValueError(f"Reference waveform produced an empty latent: {path}")
-                latent_pieces.append(piece)
+                trim_seconds = (
+                    max_ref_seconds if len(wav_paths) == 1 and max_ref_seconds > 0 else None
+                )
+                fingerprint = None
+                cache_key = None
+                cached = None
+                if cache is not None:
+                    try:
+                        fingerprint = cache.file_fingerprint(path)
+                    except OSError:
+                        # Leave unreadable paths to the loader and its usual error.
+                        fingerprint = None
+                if fingerprint is not None:
+                    cache_key = (
+                        fingerprint,
+                        trim_seconds,
+                        req.ref_normalize_db,
+                        bool(req.ref_ensure_max),
+                    )
+                    cached = cache.get(cache_key)
+                if cached is not None:
+                    if cached.trim_message is not None:
+                        messages.append(cached.trim_message)
+                    latent_pieces.append(cached.latent)
+                    cache_hits += 1
+                else:
+                    wav, sr = _load_audio(path)
+                    trim_message = None
+                    if trim_seconds is not None:
+                        max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
+                        if wav.shape[1] > max_ref_samples:
+                            trim_message = (
+                                f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
+                                f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
+                            )
+                            messages.append(trim_message)
+                            wav = wav[:, :max_ref_samples]
+                    piece = self.codec.encode_waveform(
+                        wav.unsqueeze(0),
+                        sample_rate=int(sr),
+                        normalize_db=req.ref_normalize_db,
+                        ensure_max=bool(req.ref_ensure_max),
+                    ).cpu()
+                    if piece.shape[1] == 0:
+                        raise ValueError(f"Reference waveform produced an empty latent: {path}")
+                    # Skip caching when the file changed while it was being read.
+                    if cache_key is not None and cache.file_unchanged(fingerprint):
+                        cache.put(cache_key, piece, trim_message)
+                    latent_pieces.append(piece)
                 if (
                     max_ref_latent_steps is not None
                     and sum(int(item.shape[1]) for item in latent_pieces) >= max_ref_latent_steps
@@ -955,6 +1138,10 @@ class InferenceRuntime:
                     f"info: encoded and concatenated {len(latent_pieces)}/{len(wav_paths)} "
                     "reference waveforms in input order "
                     f"({ref_latent.shape[1]} latent steps before max-length trimming)."
+                )
+            if cache_hits:
+                messages.append(
+                    f"info: reused {cache_hits}/{len(latent_pieces)} cached reference latent(s)."
                 )
 
         if max_ref_latent_steps is not None and ref_latent.shape[1] > max_ref_latent_steps:
@@ -1253,6 +1440,7 @@ class InferenceRuntime:
             _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
 
             hop_length = int(self.codec.model.hop_length)
+            encoded_conditions = None
             if manual_seconds is not None:
                 clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
                 if clamped_seconds != manual_seconds:
@@ -1282,14 +1470,8 @@ class InferenceRuntime:
                     max_text_len=text_max_len,
                     has_speaker=has_speaker_duration,
                 ).to(self.model_device)
-                (
-                    duration_text_state,
-                    duration_text_mask,
-                    duration_speaker_state,
-                    _duration_speaker_mask,
-                    _duration_caption_state,
-                    _duration_caption_mask,
-                ) = self.model.encode_conditions(
+                # The sampler encodes exactly the same inputs, so it reuses these.
+                encoded_conditions = self.model.encode_conditions(
                     text_input_ids=text_ids,
                     text_mask=text_mask,
                     ref_latent=ref_latent,
@@ -1300,6 +1482,14 @@ class InferenceRuntime:
                     speaker_mask_override=speaker_mask_override,
                     speaker_uncond_mode=req.speaker_uncond_mode,
                 )
+                (
+                    duration_text_state,
+                    duration_text_mask,
+                    duration_speaker_state,
+                    _duration_speaker_mask,
+                    _duration_caption_state,
+                    _duration_caption_mask,
+                ) = encoded_conditions
                 pred_log_frames = self.model.predict_duration_log_frames(
                     text_state=duration_text_state,
                     text_mask=duration_text_mask,
@@ -1370,38 +1560,62 @@ class InferenceRuntime:
                     speaker_uncond_mode=req.speaker_uncond_mode,
                     num_steps=num_steps,
                     seed=used_seed,
+                    encoded_conditions=encoded_conditions,
                 )
             else:
-                z_patched = sample_euler_rf_cfg(
-                    model=self.model,
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    sequence_length=patched_steps,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_uncond_mode=req.speaker_uncond_mode,
-                    num_steps=num_steps,
-                    cfg_scale_text=cfg_scale_text,
-                    cfg_scale_caption=cfg_scale_caption,
-                    cfg_scale_speaker=cfg_scale_speaker,
-                    cfg_guidance_mode=cfg_mode,
-                    cfg_min_t=float(req.cfg_min_t),
-                    cfg_max_t=float(req.cfg_max_t),
-                    seed=used_seed,
-                    truncation_factor=truncation_factor,
-                    rescale_k=rescale_k,
-                    rescale_sigma=rescale_sigma,
-                    use_context_kv_cache=bool(req.context_kv_cache),
-                    speaker_kv_scale=speaker_kv_scale,
-                    speaker_kv_max_layers=speaker_kv_max_layers,
-                    speaker_kv_min_t=speaker_kv_min_t,
-                    t_schedule_mode=str(req.t_schedule_mode),
-                    sway_coeff=float(req.sway_coeff),
-                )
+                # Adapters make the module differ from what graphs would be
+                # captured against, so LoRA runtimes stay eager.
+                graph_forward = None if self._lora_adapter_names else self._graph_forward
+                stats_before = None
+                if graph_forward is not None:
+                    stats_before = replace(graph_forward.stats)
+                    graph_forward.begin_request()
+                try:
+                    z_patched = sample_euler_rf_cfg(
+                        model=self.model,
+                        text_input_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        sequence_length=patched_steps,
+                        caption_input_ids=caption_ids,
+                        caption_mask=caption_mask,
+                        speaker_state_override=speaker_state_override,
+                        speaker_mask_override=speaker_mask_override,
+                        speaker_uncond_mode=req.speaker_uncond_mode,
+                        num_steps=num_steps,
+                        cfg_scale_text=cfg_scale_text,
+                        cfg_scale_caption=cfg_scale_caption,
+                        cfg_scale_speaker=cfg_scale_speaker,
+                        cfg_guidance_mode=cfg_mode,
+                        cfg_min_t=float(req.cfg_min_t),
+                        cfg_max_t=float(req.cfg_max_t),
+                        seed=used_seed,
+                        truncation_factor=truncation_factor,
+                        rescale_k=rescale_k,
+                        rescale_sigma=rescale_sigma,
+                        use_context_kv_cache=bool(req.context_kv_cache),
+                        speaker_kv_scale=speaker_kv_scale,
+                        speaker_kv_max_layers=speaker_kv_max_layers,
+                        speaker_kv_min_t=speaker_kv_min_t,
+                        t_schedule_mode=str(req.t_schedule_mode),
+                        sway_coeff=float(req.sway_coeff),
+                        encoded_conditions=encoded_conditions,
+                        forward_fn=graph_forward,
+                    )
+                finally:
+                    if graph_forward is not None:
+                        graph_forward.end_request()
+                if graph_forward is not None and stats_before is not None:
+                    stats = graph_forward.stats
+                    _log(
+                        "[runtime] cuda_graph: "
+                        f"captures={stats.captures - stats_before.captures} "
+                        f"replays={stats.replays - stats_before.replays} "
+                        f"eager={stats.eager_calls - stats_before.eager_calls} "
+                        f"failures={stats.capture_failures - stats_before.capture_failures} "
+                        f"skipped_for_memory={stats.skipped_for_memory - stats_before.skipped_for_memory}"
+                    )
             stage_sec = _measure_end(self.model_device, t0)
             sample_stage = (
                 "sample_meanflow"
@@ -1495,6 +1709,10 @@ class InferenceRuntime:
         )
 
     def unload(self) -> None:
+        if self._graph_forward is not None:
+            self._graph_forward.clear()
+            self._graph_forward = None
+        self.reference_cache.clear()
         del self.model
         del self.tokenizer
         del self.codec
