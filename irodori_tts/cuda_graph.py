@@ -19,19 +19,31 @@ Inputs fall into two groups:
   objects (CFG cond/uncond) simply use two graphs.
 
 Graphs hold references to the request's tensors, so ``end_request()`` must be
-called when sampling finishes; it releases every graph. Call ``clear()`` when
-the wrapped module changes. One instance must not be used from several threads
-at once. Other threads may keep running CUDA work during a capture, except
-random ops on PyTorch's default CUDA generator, which PyTorch rejects while any
-thread is capturing.
+called when sampling finishes; it releases every graph.
+
+``persistent=True`` keeps graphs across requests instead, for callers that
+replay the same shapes often (short interactive lines). Every tensor input is
+then copied into graph-owned buffers before each replay, so only shapes select
+a graph. Copies of the same input slot and shape are shared by all graphs, and
+all graphs share one memory pool, which keeps the VRAM cost of holding many
+lengths low. A persistent graph still reads module state directly, so
+``keepalive`` must return any buffer the module may replace (such as the RoPE
+cache), and ``fn`` must not bake input values into host-side decisions (such as
+an attention plan built from mask contents). Keys whose capture failed stay
+eager until ``clear()``, which is also required when the wrapped module
+changes.
+
+One instance must not be used from several threads at once. Other threads may
+keep running CUDA work during a capture, except random ops on PyTorch's default
+CUDA generator, which PyTorch rejects while any thread is capturing.
 """
 
 from __future__ import annotations
 
 import os
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -114,6 +126,17 @@ def _tree_bytes(value: Any) -> int:
     return sum(leaf.numel() * leaf.element_size() for leaf in _tensor_leaves(value))
 
 
+def _replace_leaves(value: Any, leaves: Iterator[torch.Tensor]) -> Any:
+    """``value`` with its tensors replaced, in ``_tensor_leaves`` order, by ``leaves``."""
+    if isinstance(value, torch.Tensor):
+        return next(leaves)
+    if isinstance(value, list):
+        return [_replace_leaves(item, leaves) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_leaves(item, leaves) for item in value)
+    return value
+
+
 @dataclass
 class _GraphEntry:
     graph: torch.cuda.CUDAGraph
@@ -122,6 +145,9 @@ class _GraphEntry:
     # References that keep the read-in-place inputs and module buffers alive
     # (their ids are part of the key, so they must not be recycled).
     held: tuple[object, ...]
+    # Persistent mode only: graph-owned copies of every other tensor input,
+    # refreshed from the caller's tensors before each replay.
+    static_conditions: dict[str, tuple[torch.Tensor, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -136,7 +162,8 @@ class CUDAGraphStats:
 
 
 class CUDAGraphForward:
-    """Replay ``fn(**kwargs)`` through CUDA Graphs within one request.
+    """Replay ``fn(**kwargs)`` through CUDA Graphs within one request (or across
+    requests with ``persistent=True``).
 
     ``capture_after`` eager calls of a key run before it is captured, so
     one-off calls never pay for a capture. The capturing call returns the
@@ -153,6 +180,7 @@ class CUDAGraphForward:
         max_entries: int = 4,
         memory_reserve_ratio: float = 0.15,
         keepalive: Callable[[], Iterable[object]] | None = None,
+        persistent: bool = False,
     ) -> None:
         if capture_after < 0:
             raise ValueError(f"capture_after must be >= 0, got {capture_after}")
@@ -171,6 +199,11 @@ class CUDAGraphForward:
         self._failed: set[Any] = set()
         # Keeps objects whose ids appear in _eager_counts/_failed alive.
         self._pinned: list[object] = []
+        self._persistent = bool(persistent)
+        # Persistent mode: condition copies shared by every graph with the same
+        # input slot and shape, and one memory pool for all graph intermediates.
+        self._shared_conditions: dict[Any, torch.Tensor] = {}
+        self._pool: Any = None
         self.stats = CUDAGraphStats()
 
     @property
@@ -178,33 +211,50 @@ class CUDAGraphForward:
         return len(self._entries)
 
     @property
+    def persistent(self) -> bool:
+        return self._persistent
+
+    @property
     def static_bytes(self) -> int:
-        return sum(
+        steps = sum(
             _tree_bytes(list(entry.static_steps.values())) for entry in self._entries.values()
         )
+        return steps + _tree_bytes(list(self._shared_conditions.values()))
 
     def begin_request(self) -> None:
-        """Start a sampling loop with no graphs from earlier requests."""
+        """Start a sampling loop; per-request mode drops graphs from earlier requests."""
         self.end_request()
 
     def end_request(self) -> None:
-        """Release every graph and every reference to the request's tensors."""
+        """Release every reference to the request's tensors.
+
+        Per-request mode also releases every graph. Persistent graphs hold only
+        their own copies of the inputs, so they are kept for later requests.
+        """
+        if self._persistent:
+            return
+        self._release_graphs()
+
+    def clear(self) -> None:
+        """Release every captured graph; required after the wrapped module changes."""
+        self._release_graphs()
+        self._shared_conditions.clear()
+        self._pool = None
+
+    def _release_graphs(self) -> None:
         self._entries.clear()
         self._eager_counts.clear()
         self._failed.clear()
         self._pinned.clear()
 
-    def clear(self) -> None:
-        """Release every captured graph; required after the wrapped module changes."""
-        self.end_request()
-
     def _key(self, kwargs: dict[str, Any]) -> Any:
         parts = []
         for name in sorted(kwargs):
             value = kwargs[name]
+            # Persistent graphs copy every input, so only shapes select a graph.
             identity = (
                 ()
-                if name in self._step_inputs
+                if self._persistent or name in self._step_inputs
                 else tuple(id(leaf) for leaf in _tensor_leaves(value))
             )
             parts.append((name, _shape_key(value), identity))
@@ -226,6 +276,9 @@ class CUDAGraphForward:
         return self._capture(key, kwargs)
 
     def _pin(self, kwargs: dict[str, Any]) -> None:
+        if self._persistent:
+            # Persistent keys hold no ids, so nothing has to outlive the request.
+            return
         for name, value in kwargs.items():
             if name not in self._step_inputs:
                 self._pinned.extend(_tensor_leaves(value))
@@ -267,6 +320,19 @@ class CUDAGraphForward:
                 raise TypeError(f"Step input {name!r} must be a tensor or None.")
             static_steps[name] = value.detach().clone()
             graph_kwargs[name] = static_steps[name]
+        static_conditions: dict[str, tuple[torch.Tensor, ...]] = {}
+        if self._persistent:
+            for name, value in kwargs.items():
+                if name in self._step_inputs:
+                    continue
+                copies = tuple(
+                    self._shared_condition(name, index, leaf)
+                    for index, leaf in enumerate(_tensor_leaves(value))
+                )
+                static_conditions[name] = copies
+                graph_kwargs[name] = _replace_leaves(value, iter(copies))
+            if self._pool is None:
+                self._pool = torch.cuda.graph_pool_handle()
 
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
@@ -286,7 +352,11 @@ class CUDAGraphForward:
             # thread_local: the default "global" mode makes CUDA calls from
             # other threads (e.g. a concurrent request's kernels and syncs)
             # fail while this thread captures.
-            with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            # Persistent graphs share one pool: replays never overlap and each
+            # output is cloned before the next replay can reuse its memory.
+            with torch.cuda.graph(
+                graph, pool=self._pool, stream=stream, capture_error_mode="thread_local"
+            ):
                 static_output = self._fn(**graph_kwargs)
         except Exception:
             del graph
@@ -295,12 +365,16 @@ class CUDAGraphForward:
             self.stats.capture_failures += 1
             _consume_pending_capture_error(device)
             return warm_output
-        held: list[object] = [
-            leaf
-            for name, value in kwargs.items()
-            if name not in self._step_inputs
-            for leaf in _tensor_leaves(value)
-        ]
+        held: list[object] = (
+            []
+            if self._persistent
+            else [
+                leaf
+                for name, value in kwargs.items()
+                if name not in self._step_inputs
+                for leaf in _tensor_leaves(value)
+            ]
+        )
         if self._keepalive is not None:
             held.extend(self._keepalive())
         self._entries[key] = _GraphEntry(
@@ -308,14 +382,30 @@ class CUDAGraphForward:
             static_steps=static_steps,
             static_output=static_output,
             held=tuple(held),
+            static_conditions=static_conditions,
         )
         self.stats.captures += 1
         return warm_output
+
+    def _shared_condition(self, name: str, index: int, leaf: torch.Tensor) -> torch.Tensor:
+        """The persistent copy slot for one condition tensor, filled with ``leaf``."""
+        slot = (name, index, tuple(leaf.shape), tuple(leaf.stride()), leaf.dtype, leaf.device)
+        copy = self._shared_conditions.get(slot)
+        if copy is None:
+            copy = leaf.detach().clone()
+            self._shared_conditions[slot] = copy
+        else:
+            copy.copy_(leaf)
+        return copy
 
     def _replay(self, entry: _GraphEntry, kwargs: dict[str, Any]) -> torch.Tensor:
         for name, static in entry.static_steps.items():
             static.copy_(kwargs[name], non_blocking=True)
             self.stats.step_copy_bytes += static.numel() * static.element_size()
+        for name, copies in entry.static_conditions.items():
+            # Copied every replay, so in-place updates of a condition are seen.
+            for copy, leaf in zip(copies, _tensor_leaves(kwargs[name]), strict=True):
+                copy.copy_(leaf, non_blocking=True)
         entry.graph.replay()
         self.stats.replays += 1
         return entry.static_output.clone()

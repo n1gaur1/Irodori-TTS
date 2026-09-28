@@ -416,6 +416,102 @@ def test_clear_releases_entries():
 
 
 @requires_cuda
+def test_persistent_graph_is_reused_for_new_condition_objects():
+    device = torch.device("cuda")
+    runner = CUDAGraphForward(_affine, capture_after=0, persistent=True)
+    x, cache_a = _inputs(device, seed=0)
+    _, cache_b = _inputs(device, seed=1)
+
+    runner.begin_request()
+    first = runner(x_t=x, cache=cache_a, scale=1.0)
+    runner.end_request()
+    runner.begin_request()
+    second = runner(x_t=x + 1, cache=cache_b, scale=1.0)
+    runner.end_request()
+
+    assert torch.equal(first, _affine(x_t=x, cache=cache_a, scale=1.0))
+    assert torch.equal(second, _affine(x_t=x + 1, cache=cache_b, scale=1.0))
+    assert runner.stats.captures == 1
+    assert runner.stats.replays == 1
+    assert runner.num_entries == 1
+
+
+@requires_cuda
+def test_persistent_graph_never_writes_into_or_holds_caller_tensors():
+    device = torch.device("cuda")
+    runner = CUDAGraphForward(_affine, capture_after=0, persistent=True)
+    x, cache = _inputs(device)
+    before = [tuple(t.clone() for t in layer) for layer in cache]
+    runner.begin_request()
+
+    runner(x_t=x, cache=cache, scale=1.0)
+    runner(x_t=x + 1, cache=cache, scale=1.0)
+    runner.end_request()
+
+    for layer, original in zip(cache, before, strict=True):
+        for tensor, value in zip(layer, original, strict=True):
+            assert torch.equal(tensor, value)
+    caller_ids = {id(t) for layer in cache for t in layer}
+    for entry in runner._entries.values():
+        assert not caller_ids & {id(obj) for obj in entry.held}
+        assert not caller_ids & {
+            id(t) for copies in entry.static_conditions.values() for t in copies
+        }
+    assert runner._pinned == []
+
+
+@requires_cuda
+def test_persistent_graph_sees_in_place_updates_of_conditions():
+    device = torch.device("cuda")
+    runner = CUDAGraphForward(_affine, capture_after=0, persistent=True)
+    x, cache = _inputs(device)
+    runner(x_t=x, cache=cache, scale=1.0)
+
+    for layer in cache:
+        layer[0].mul_(3.0)
+    out = runner(x_t=x + 1, cache=cache, scale=1.0)
+
+    assert torch.equal(out, _affine(x_t=x + 1, cache=cache, scale=1.0))
+    assert runner.stats.replays == 1
+
+
+@requires_cuda
+def test_persistent_graphs_of_different_lengths_share_condition_copies():
+    device = torch.device("cuda")
+    runner = CUDAGraphForward(_affine, capture_after=0, persistent=True)
+    _, cache = _inputs(device)
+    lengths = (2, 5, 9)
+    xs = {rows: _inputs(device, rows=rows)[0] for rows in lengths}
+
+    for rows in (*lengths, *lengths):
+        assert torch.equal(
+            runner(x_t=xs[rows], cache=cache, scale=1.0),
+            _affine(x_t=xs[rows], cache=cache, scale=1.0),
+        )
+
+    assert runner.stats.captures == len(lengths)
+    assert runner.stats.replays == len(lengths)
+    cache_bytes = sum(t.numel() * t.element_size() for layer in cache for t in layer)
+    step_bytes = sum(x.numel() * x.element_size() for x in xs.values())
+    assert runner.static_bytes == cache_bytes + step_bytes
+
+
+@requires_cuda
+def test_persistent_clear_releases_graphs_and_copies():
+    device = torch.device("cuda")
+    runner = CUDAGraphForward(_affine, capture_after=0, persistent=True)
+    x, cache = _inputs(device)
+    runner(x_t=x, cache=cache, scale=1.0)
+    runner.end_request()
+    assert runner.num_entries == 1
+
+    runner.clear()
+
+    assert runner.num_entries == 0
+    assert runner.static_bytes == 0
+
+
+@requires_cuda
 def test_keepalive_holds_replaced_buffer_storage():
     device = torch.device("cuda")
     holder = {"table": torch.arange(4.0, device=device)}

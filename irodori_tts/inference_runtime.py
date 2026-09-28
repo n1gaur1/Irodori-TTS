@@ -20,6 +20,7 @@ import torchaudio
 from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
 
+from .attention import fa3_usable
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig, merge_dataclass_overrides
 from .cuda_graph import CUDAGraphForward, resolve_cuda_graph_mode
@@ -223,6 +224,10 @@ class RuntimeKey:
     # auto | on | off. auto uses CUDA Graphs on CUDA without compile_model and
     # honors IRODORI_CUDA_GRAPH. Replayed forwards match eager output exactly.
     cuda_graph: str = "auto"
+    # 0 captures graphs per request. N > 0 keeps up to N graphs across requests
+    # (keyed by shape only), so repeated lengths skip the capture; each output
+    # length needs two graphs (the CFG batch and the cond-only batch).
+    cuda_graph_persistent_entries: int = 0
     # Encoded reference-audio latents kept on the CPU, keyed by file content
     # and encode settings. Used only with codec_deterministic_encode=True.
     # 0 entries disables the cache.
@@ -750,6 +755,11 @@ class InferenceRuntime:
                 # Graphs read module buffers such as the RoPE cache directly;
                 # keep their storage alive even if the attribute is replaced.
                 keepalive=lambda: tuple(self.model.buffers()),
+                **(
+                    {"persistent": True, "max_entries": int(key.cuda_graph_persistent_entries)}
+                    if key.cuda_graph_persistent_entries > 0
+                    else {}
+                ),
             )
         self.reference_cache = ReferenceLatentCache(
             max_entries=int(key.reference_cache_max_entries),
@@ -766,10 +776,23 @@ class InferenceRuntime:
             device=model_device,
             compile_model=bool(key.compile_model),
         )
+        if int(key.cuda_graph_persistent_entries) < 0:
+            raise ValueError(
+                "cuda_graph_persistent_entries must be >= 0, "
+                f"got {key.cuda_graph_persistent_entries}"
+            )
         model_dtype = resolve_runtime_dtype(
             precision=key.model_precision,
             device=model_device,
         )
+        if key.cuda_graph_persistent_entries > 0 and fa3_usable(model_device, model_dtype):
+            # The FA3 attention plan bakes the mask contents (valid text length)
+            # into a graph, so a graph keyed by shape alone would be wrong for
+            # the next text.
+            raise ValueError(
+                "cuda_graph_persistent_entries requires the SDPA attention backend; "
+                "set IRODORI_ATTENTION_BACKEND=sdpa or use per-request graphs."
+            )
         codec_dtype = resolve_runtime_dtype(
             precision=key.codec_precision,
             device=codec_device,

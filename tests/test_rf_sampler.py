@@ -253,3 +253,59 @@ def test_cuda_graph_short_long_short_matches_eager():
             outs.append(graphed)
 
     assert torch.equal(outs[0], outs[2])
+
+
+@requires_cuda
+@pytest.mark.parametrize("mode", ["independent", "joint", "alternating"])
+@pytest.mark.parametrize("speaker_kv_scale", [None, 1.7])
+def test_persistent_cuda_graph_matches_eager_across_requests(mode, speaker_kv_scale):
+    """Graphs kept across requests must give eager results for new texts and lengths."""
+    from irodori_tts.cuda_graph import CUDAGraphForward
+
+    device = torch.device("cuda")
+    model = build_tiny_model(device)
+    first = tiny_inputs(device)
+    # A different valid text length checks that no mask contents are baked in.
+    second_mask = first["text_mask"].clone()
+    second_mask[:, -2] = True
+    second = {
+        **first,
+        "text_input_ids": (first["text_input_ids"] + 7) % 50,
+        "text_mask": second_mask,
+    }
+    scales = (
+        {"cfg_scale_text": 2.0, "cfg_scale_caption": 2.0, "cfg_scale_speaker": 2.0}
+        if mode == "joint"
+        else {}
+    )
+    common = {
+        "cfg_guidance_mode": mode,
+        "speaker_kv_scale": speaker_kv_scale,
+        "speaker_kv_min_t": 0.6,
+        "num_steps": 10,
+        **scales,
+    }
+    runner = CUDAGraphForward(
+        model.forward_with_encoded_conditions,
+        capture_after=1,
+        max_entries=16,
+        persistent=True,
+        # As in InferenceRuntime: a longer length replaces the RoPE cache buffer,
+        # and graphs of shorter lengths still read the old one.
+        keepalive=lambda: tuple(model.buffers()),
+    )
+    requests = [(first, 5), (second, 5), (first, 23), (second, 5), (first, 23)]
+
+    with torch.inference_mode():
+        for index, (inputs, length) in enumerate(requests):
+            eager = _sample(model, inputs, sequence_length=length, **common)
+            runner.begin_request()
+            graphed = _sample(model, inputs, sequence_length=length, forward_fn=runner, **common)
+            runner.end_request()
+            assert torch.equal(eager, graphed), f"request {index}"
+            if index == 2:
+                captures_after_both_lengths = runner.stats.captures
+
+    # The last two requests reuse lengths seen before, so they capture nothing.
+    assert runner.stats.captures == captures_after_both_lengths
+    assert runner.stats.replays > 0

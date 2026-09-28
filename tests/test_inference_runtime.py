@@ -12,6 +12,7 @@ from irodori_tts.config import ModelConfig
 from irodori_tts.inference_runtime import (
     InferenceRuntime,
     ReferenceLatentCache,
+    RuntimeKey,
     SamplingRequest,
     find_flattening_point,
 )
@@ -388,3 +389,35 @@ def test_reference_cache_not_stored_when_file_changes_during_read(tmp_path, monk
     _load(runtime, ref_wav=path)
 
     assert len(runtime.reference_cache) == 0
+
+
+def test_negative_persistent_graph_entries_are_rejected_before_loading(tmp_path):
+    key = RuntimeKey(
+        checkpoint=str(tmp_path / "never-loaded.safetensors"),
+        model_device="cpu",
+        cuda_graph_persistent_entries=-1,
+    )
+
+    with pytest.raises(ValueError, match="cuda_graph_persistent_entries must be >= 0"):
+        InferenceRuntime.from_key(key)
+
+
+def test_persistent_graphs_are_rejected_with_fa3_before_loading(tmp_path, monkeypatch):
+    monkeypatch.setattr("irodori_tts.inference_runtime.fa3_usable", lambda *_a: True)
+    key = RuntimeKey(
+        checkpoint=str(tmp_path / "never-loaded.safetensors"),
+        model_device="cpu",
+        cuda_graph_persistent_entries=8,
+    )
+
+    with pytest.raises(ValueError, match="IRODORI_ATTENTION_BACKEND=sdpa"):
+        InferenceRuntime.from_key(key)
+
+
+def test_per_request_graphs_do_not_check_fa3(tmp_path, monkeypatch):
+    monkeypatch.setattr("irodori_tts.inference_runtime.fa3_usable", lambda *_a: True)
+    key = RuntimeKey(checkpoint=str(tmp_path / "missing.safetensors"), model_device="cpu")
+
+    # Validation passes, so loading is reached and fails on the missing file.
+    with pytest.raises(FileNotFoundError):
+        InferenceRuntime.from_key(key)
